@@ -1,0 +1,381 @@
+#Region '.\Private\ConvertFrom-FeedHtml.ps1' -1
+
+function ConvertFrom-FeedHtml {
+    param([string] $Html)
+
+    $text = $Html -replace '(?is)<(script|style)\b[^>]*>.*?</\1\s*>', '' `
+                  -replace '(?i)<br\s*/?>|</(?:p|div|h[1-6]|li|blockquote)\s*>', "`n`n" `
+                  -replace '<[^>]*>', ''
+    $text = [Net.WebUtility]::HtmlDecode($text) -replace '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]', ''
+    ($text -replace '\r\n?', "`n" -replace '\n{3,}', "`n`n").Trim()
+}
+#EndRegion '.\Private\ConvertFrom-FeedHtml.ps1' 10
+#Region '.\Private\Get-SubstackArchive.ps1' -1
+
+function Get-SubstackArchive {
+    param([string] $Url)
+
+    $archive = Invoke-RestMethod -Uri "$Url/api/v1/archive?sort=new&limit=10" `
+        -ConnectionTimeoutSeconds 5 -OperationTimeoutSeconds 8 -ErrorAction Stop
+    $entries = if ($archive -is [array]) { $archive } elseif ($null -ne $archive.posts) { $archive.posts }
+               elseif ($archive.slug) { $archive }
+    foreach ($entry in $entries) {
+        $link = $null
+        if (-not [uri]::TryCreate([string]$entry.canonical_url, 'Absolute', [ref]$link) -or
+            $link.Scheme -ne 'https' -or $link.UserInfo) { continue }
+        $detailsUrl = if ($entry.audience -eq 'everyone' -and $entry.slug -match '^[a-zA-Z0-9_-]+$') {
+            "$Url/api/v1/posts/$($entry.slug)"
+        }
+        [pscustomobject]@{
+            Title = (ConvertFrom-FeedHtml $entry.title) -replace '\s+', ' '
+            Url = $link.AbsoluteUri
+            Published = if ($entry.post_date -is [datetime] -or $entry.post_date -is [datetimeoffset]) {
+                $entry.post_date.ToString('o')
+            } else { [string]$entry.post_date }
+            Text = ConvertFrom-FeedHtml $entry.subtitle
+            DetailsUrl = $detailsUrl
+        }
+    }
+}
+#EndRegion '.\Private\Get-SubstackArchive.ps1' 26
+#Region '.\Public\ConvertTo-SubstackPublicationUrl.ps1' -1
+
+function ConvertTo-SubstackPublicationUrl {
+    <#
+    .SYNOPSIS
+    Validates and normalizes the HTTPS home address of a Substack publication.
+    .EXAMPLE
+    ConvertTo-SubstackPublicationUrl 'EXAMPLE.substack.com/'
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $Url)
+
+    $text = $Url.Trim()
+    if ($text -notmatch '^[a-z][a-z0-9+.-]*://') { $text = "https://$text" }
+    $uri = $null
+    if (-not [uri]::TryCreate($text, 'Absolute', [ref]$uri) -or
+        $uri.Scheme -ne 'https' -or $uri.HostNameType -ne 'Dns' -or
+        -not $uri.IsDefaultPort -or $uri.UserInfo -or
+        $uri.AbsolutePath -ne '/' -or $uri.Query -or $uri.Fragment) {
+        throw 'Enter an HTTPS publication address, for example example.substack.com.'
+    }
+    'https://' + $uri.IdnHost.TrimEnd('.').ToLowerInvariant()
+}
+#EndRegion '.\Public\ConvertTo-SubstackPublicationUrl.ps1' 22
+#Region '.\Public\Get-SubstackPostPreview.ps1' -1
+
+function Get-SubstackPostPreview {
+    <#
+    .SYNOPSIS
+    Returns the public text or excerpt of a post.
+    .PARAMETER Post
+    A post object returned by Get-SubstackPosts.
+    .EXAMPLE
+    $posts = @(Get-SubstackPosts 'igregui.substack.com')
+    if ($posts.Count) { Get-SubstackPostPreview -Post $posts[0] }
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory, ValueFromPipeline)] [psobject] $Post)
+
+    process {
+        $detailsUrl = $null
+        if ([uri]::TryCreate([string]$Post.DetailsUrl, 'Absolute', [ref]$detailsUrl) -and
+            $detailsUrl.Scheme -eq 'https' -and -not $detailsUrl.UserInfo -and
+            $detailsUrl.AbsolutePath -match '^/api/v1/posts/[a-zA-Z0-9_-]+$') {
+            try {
+                $details = Invoke-RestMethod -Uri $detailsUrl -ConnectionTimeoutSeconds 5 -OperationTimeoutSeconds 8 -ErrorAction Stop
+                $body = ConvertFrom-FeedHtml $details.body_html
+                if ($body) { $Post.Text = $body }
+                $Post.DetailsUrl = $null
+            } catch { Write-Verbose $_.Exception.Message }
+        }
+        $Post.Text
+    }
+}
+#EndRegion '.\Public\Get-SubstackPostPreview.ps1' 29
+#Region '.\Public\Get-SubstackPosts.ps1' -1
+
+function Get-SubstackPosts {
+    <#
+    .SYNOPSIS
+    Gets public posts from a Substack publication.
+    .PARAMETER Url
+    The HTTPS home address of the publication. The scheme is optional.
+    .EXAMPLE
+    Get-SubstackPosts -Url 'igregui.substack.com'
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $Url)
+
+    $Url = ConvertTo-SubstackPublicationUrl $Url
+    $response = Invoke-WebRequest -Uri "$Url/feed" -ConnectionTimeoutSeconds 5 -OperationTimeoutSeconds 8 -ErrorAction Stop
+    $settings = [Xml.XmlReaderSettings]::new()
+    $settings.DtdProcessing = 'Prohibit'
+    $settings.MaxCharactersInDocument = 8MB
+    $source = [IO.StringReader]::new($response.Content)
+    $reader = [Xml.XmlReader]::Create($source, $settings)
+    try {
+        $feed = [xml]::new()
+        $feed.Load($reader)
+    } finally {
+        $reader.Dispose()
+        $source.Dispose()
+    }
+    if (-not $feed.SelectSingleNode('/rss/channel')) { throw 'The publication did not return an RSS feed.' }
+
+    $posts = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    foreach ($item in $feed.SelectNodes('/rss/channel/item')) {
+        $link = $null
+        if (-not [uri]::TryCreate($item.SelectSingleNode('link').InnerText, 'Absolute', [ref]$link) -or
+            $link.Scheme -ne 'https' -or $link.UserInfo) { continue }
+
+        $body = $item.SelectSingleNode("*[local-name()='encoded' and namespace-uri()='http://purl.org/rss/1.0/modules/content/']")
+        if (-not $body) { $body = $item.SelectSingleNode('description') }
+        $title = (ConvertFrom-FeedHtml ($item.SelectSingleNode('title').InnerText)) -replace '\s+', ' '
+        $key = $link.GetLeftPart('Path').TrimEnd('/')
+        $posts[$key] = [pscustomobject]@{
+            Title = $title
+            Url = $link.AbsoluteUri
+            Published = $item.SelectSingleNode('pubDate').InnerText
+            Text = ConvertFrom-FeedHtml $body.InnerText
+        }
+    }
+
+    try {
+        foreach ($post in Get-SubstackArchive $Url) {
+            $key = ([uri]$post.Url).GetLeftPart('Path').TrimEnd('/')
+            [void]$posts.TryAdd($key, $post)
+        }
+    } catch {
+        if ($posts.Count -eq 0) { throw }
+        Write-Verbose "Could not refresh the archive for $Url. $($_.Exception.Message)"
+    }
+
+    $posts.Values | Sort-Object -Stable -Descending -Property {
+        $date = [DateTimeOffset]::MinValue
+        [void][DateTimeOffset]::TryParse($_.Published, [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$date)
+        $date
+    }
+}
+#EndRegion '.\Public\Get-SubstackPosts.ps1' 64
+
+
+# SIG # Begin signature block
+# MIIodAYJKoZIhvcNAQcCoIIoZTCCKGECAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCD9GtSM3L/mZM/U
+# YbdI3/7Le3ubPQMbwlFwZBPBBTt/z6CCIKgwggXJMIIEsaADAgECAhAbtY8lKt8j
+# AEkoya49fu0nMA0GCSqGSIb3DQEBDAUAMH4xCzAJBgNVBAYTAlBMMSIwIAYDVQQK
+# ExlVbml6ZXRvIFRlY2hub2xvZ2llcyBTLkEuMScwJQYDVQQLEx5DZXJ0dW0gQ2Vy
+# dGlmaWNhdGlvbiBBdXRob3JpdHkxIjAgBgNVBAMTGUNlcnR1bSBUcnVzdGVkIE5l
+# dHdvcmsgQ0EwHhcNMjEwNTMxMDY0MzA2WhcNMjkwOTE3MDY0MzA2WjCBgDELMAkG
+# A1UEBhMCUEwxIjAgBgNVBAoTGVVuaXpldG8gVGVjaG5vbG9naWVzIFMuQS4xJzAl
+# BgNVBAsTHkNlcnR1bSBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0eTEkMCIGA1UEAxMb
+# Q2VydHVtIFRydXN0ZWQgTmV0d29yayBDQSAyMIICIjANBgkqhkiG9w0BAQEFAAOC
+# Ag8AMIICCgKCAgEAvfl4+ObVgAxknYYblmRnPyI6HnUBfe/7XGeMycxca6mR5rlC
+# 5SBLm9qbe7mZXdmbgEvXhEArJ9PoujC7Pgkap0mV7ytAJMKXx6fumyXvqAoAl4Va
+# qp3cKcniNQfrcE1K1sGzVrihQTib0fsxf4/gX+GxPw+OFklg1waNGPmqJhCrKtPQ
+# 0WeNG0a+RzDVLnLRxWPa52N5RH5LYySJhi40PylMUosqp8DikSiJucBb+R3Z5yet
+# /5oCl8HGUJKbAiy9qbk0WQq/hEr/3/6zn+vZnuCYI+yma3cWKtvMrTscpIfcRnNe
+# GWJoRVfkkIJCu0LW8GHgwaM9ZqNd9BjuiMmNF0UpmTJ1AjHuKSbIawLmtWJFfzcV
+# WiNoidQ+3k4nsPBADLxNF8tNorMe0AZa3faTz1d1mfX6hhpneLO/lv403L3nUlbl
+# s+V1e9dBkQXcXWnjlQ1DufyDljmVe2yAWk8TcsbXfSl6RLpSpCrVQUYJIP4ioLZb
+# MI28iQzV13D4h1L92u+sUS4Hs07+0AnacO+Y+lbmbdu1V0vc5SwlFcieLnhO+Nqc
+# noYsylfzGuXIkosagpZ6w7xQEmnYDlpGizrrJvojybawgb5CAKT41v4wLsfSRvbl
+# jnX98sy50IdbzAYQYLuDNbdeZ95H7JlI8aShFf6tjGKOOVVPORa5sWOd/7cCAwEA
+# AaOCAT4wggE6MA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0OBBYEFLahVDkCw6A/joq8
+# +tT4HKbROg79MB8GA1UdIwQYMBaAFAh2zcsH/yT2xc3tu5C84oQ3RnX3MA4GA1Ud
+# DwEB/wQEAwIBBjAvBgNVHR8EKDAmMCSgIqAghh5odHRwOi8vY3JsLmNlcnR1bS5w
+# bC9jdG5jYS5jcmwwawYIKwYBBQUHAQEEXzBdMCgGCCsGAQUFBzABhhxodHRwOi8v
+# c3ViY2Eub2NzcC1jZXJ0dW0uY29tMDEGCCsGAQUFBzAChiVodHRwOi8vcmVwb3Np
+# dG9yeS5jZXJ0dW0ucGwvY3RuY2EuY2VyMDkGA1UdIAQyMDAwLgYEVR0gADAmMCQG
+# CCsGAQUFBwIBFhhodHRwOi8vd3d3LmNlcnR1bS5wbC9DUFMwDQYJKoZIhvcNAQEM
+# BQADggEBAFHCoVgWIhCL/IYx1MIy01z4S6Ivaj5N+KsIHu3V6PrnCA3st8YeDrJ1
+# BXqxC/rXdGoABh+kzqrya33YEcARCNQOTWHFOqj6seHjmOriY/1B9ZN9DbxdkjuR
+# mmW60F9MvkyNaAMQFtXx0ASKhTP5N+dbLiZpQjy6zbzUeulNndrnQ/tjUoCFBMQl
+# lVXwfqefAcVbKPjgzoZwpic7Ofs4LphTZSJ1Ldf23SIikZbr3WjtP6MZl9M7JYjs
+# NhI9qX7OAo0FmpKnJ25FspxihjcNpDOO16hO0EoXQ0zF8ads0h5YbBRRfopUofbv
+# n3l6XYGaFpAP4bvxSgD5+d2+7arszgowggaCMIIEaqADAgECAhAo8HfBHDa9/l90
+# MkdwJy4DMA0GCSqGSIb3DQEBDAUAMFYxCzAJBgNVBAYTAlBMMSEwHwYDVQQKExhB
+# c3NlY28gRGF0YSBTeXN0ZW1zIFMuQS4xJDAiBgNVBAMTG0NlcnR1bSBUaW1lc3Rh
+# bXBpbmcgMjAyMSBDQTAeFw0yNjAzMTEwNzM0NTRaFw0zNjAyMjcwNzM0NTRaMFAx
+# CzAJBgNVBAYTAlBMMSEwHwYDVQQKDBhBc3NlY28gRGF0YSBTeXN0ZW1zIFMuQS4x
+# HjAcBgNVBAMMFUNlcnR1bSBUaW1lc3RhbXAgMjAyNjCCAiIwDQYJKoZIhvcNAQEB
+# BQADggIPADCCAgoCggIBALi9zfBw+xI12hi2F9uNQBNOSTkTIi13fuh3DiWybI53
+# 92bBfJw6tO7zDs7UqP/rejVf4xFTU3XNOPsuOFkP5SPFsnWwn3VJL+NhNhsuujvY
+# sQtaQnvNo1wk46reTgws1L8OFEdKaxgyqT4zOQx81mLwNZSqXNU9Rrb9oAJWJF4M
+# ydz+C1ebu0D0+vgM3tqAQ8TU203fqgKCPqIdHloaFqH9eyR+8tnpmy2hnnN59ZOt
+# msuHeRwf5iTOhlhf0d/qqquLOSIGPgGVL1Hj5XBUox2OE7tQRr+l/xxNbL6OuwBO
+# 4Aa2EbuxYg37cpXv5i2/lTL4NASB/duf9W4fjA3Ro+GP+bC54n2OYiM3Cq8z92ej
+# x8F5HWO2e4/75eC95B9tMw/eq7109GDyW2+2ut5Bn0o8MXJTERkyystWbqcnUkom
+# A97qfiDCwvpWuOMdfTOksXe9S+xDxOJaCbiyTivgPulxcT+tfQTRXBr5UwtPvc+I
+# NnafOEilzVHA11tv+pHcylryxBc08cUihf/ttqkZS0bmx3VxQay8uohaTp0//ECA
+# 9vYGW51SKdJMJhXvKyIdBLy8WYNchTt8yRITv9Adxg9JqGujh+TnP1bW3aQjFtlE
+# l7SzgNeI8OVA/CJAWWUuRT3Au9ToOpHy/flrrknhN4heEw7/6ILMv4HSsj0YZ4ot
+# AgMBAAGjggFQMIIBTDB1BggrBgEFBQcBAQRpMGcwOwYIKwYBBQUHMAKGL2h0dHA6
+# Ly9zdWJjYS5yZXBvc2l0b3J5LmNlcnR1bS5wbC9jdHNjYTIwMjEuY2VyMCgGCCsG
+# AQUFBzABhhxodHRwOi8vc3ViY2Eub2NzcC1jZXJ0dW0uY29tMB8GA1UdIwQYMBaA
+# FL5UAi+/QGxzQ86sCSVOnkNEGu7gMAwGA1UdEwEB/wQCMAAwOQYDVR0fBDIwMDAu
+# oCygKoYoaHR0cDovL3N1YmNhLmNybC5jZXJ0dW0ucGwvY3RzY2EyMDIxLmNybDAW
+# BgNVHSUBAf8EDDAKBggrBgEFBQcDCDAOBgNVHQ8BAf8EBAMCB4AwIgYDVR0gBBsw
+# GTAIBgZngQwBBAIwDQYLKoRoAYb2dwIFAQswHQYDVR0OBBYEFCM5aiirmhKnpKfy
+# H/lFmr+N/oIDMA0GCSqGSIb3DQEBDAUAA4ICAQBm/pObrAveTqYFPCSthxNVwBHT
+# W4TfuBQY2KGCdMlH6ALjVPYf2XARNGMTXScR0JQ2/c2LxLpoHHhRwxFf3d933DhF
+# S165rYj6iPSQKm41rc9AMpTCjMdmai1aK9o870pOzTzLRhWFVIxm+5Qf+t4V5z14
+# tPoUsAWdfRKD1Zzvzfe5AHlE9rxOZcGROiULxs3Edf7ZJ8RZI0jzD9juj2oEX2XS
+# 7BVKuNCK1W0h1mjapv028yqo8UtZh5/1Ib48Yyp88BDYShh5PSGUUuS5tYXVfcdu
+# IPBe3PdNTYRYdT5VNxkwLgjMzIcr/6SH2fejFJDjnCxjvXLuarErJg/IdI+hXdGI
+# BDVOGv1zrkF4ktoQvFZIp5DIAYh0GwyUhc87qqn5UaYTj2+iyiBDSNh7aGCrkuAn
+# qg7Qh7frhX+QhMGeJ9SpLpnG76qN85hLyjvYR6gRYiLTj8G4fxjqV400/buPw0rB
+# o9yJZyq/8cGdCOLPOYf9qpefTcrZKeO9pg+UJHx8UABbaTqizRxm8sUSEycccCCF
+# hIit3AI/3wGuSOADeiA676NcQ7+dsP04YvzvdN7pTZNyg672WpBDJdg0eItHl4yo
+# mvNeIOWh1qs4QqOW6TI8Ocsi4uSDTLorxLUDnBTwKQzzpxd1YUctEgRh32R0J9Fk
+# FkeEruJU94RljFr1uDCCBrkwggShoAMCAQICEQCZo4AKJlU7ZavcboSms+o5MA0G
+# CSqGSIb3DQEBDAUAMIGAMQswCQYDVQQGEwJQTDEiMCAGA1UEChMZVW5pemV0byBU
+# ZWNobm9sb2dpZXMgUy5BLjEnMCUGA1UECxMeQ2VydHVtIENlcnRpZmljYXRpb24g
+# QXV0aG9yaXR5MSQwIgYDVQQDExtDZXJ0dW0gVHJ1c3RlZCBOZXR3b3JrIENBIDIw
+# HhcNMjEwNTE5MDUzMjE4WhcNMzYwNTE4MDUzMjE4WjBWMQswCQYDVQQGEwJQTDEh
+# MB8GA1UEChMYQXNzZWNvIERhdGEgU3lzdGVtcyBTLkEuMSQwIgYDVQQDExtDZXJ0
+# dW0gQ29kZSBTaWduaW5nIDIwMjEgQ0EwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAw
+# ggIKAoICAQCdI88EMCM7wUYs5zNzPmNdenW6vlxNur3rLfi+5OZ+U3iZIB+AspO+
+# CC/bj+taJUbMbFP1gQBJUzDUCPx7BNLgid1TyztVLn52NKgxxu8gpyTr6EjWyGzK
+# U/gnIu+bHAse1LCitX3CaOE13rbuHbtrxF2tPU8f253QgX6eO8yTbGps1Mg+yda3
+# DcTsOYOhSYNCJiL+5wnjZ9weoGRtvFgMHtJg6i671OPXIciiHO4Lwo2p9xh/tnj+
+# JmCQEn5QU0NxzrOiRna4kjFaA9ZcwSaG7WAxeC/xoZSxF1oK1UPZtKVt+yrsGKqW
+# ONoK6f5EmBOAVEK2y4ATDSkb34UD7JA32f+Rm0wsr5ajzftDhA5mBipVZDjHpwzv
+# 8bTKzCDUSUuUmPo1govD0RwFcTtMXcfJtm1i+P2UNXadPyYVKRxKQATHN3imsfBi
+# NRdN5kiVVeqP55piqgxOkyt+HkwIA4gbmSc3hD8ke66t9MjlcNg73rZZlrLHsAIV
+# /nJ0mmgSjBI/TthoGJDydekOQ2tQD2Dup/+sKQptalDlui59SerVSJg8gAeV7N/i
+# a4mrGoiez+SqV3olVfxyLFt3o/OQOnBmjhKUANoKLYlKmUpKEFI0PfoT8Q1W/y6s
+# 9LTI6ekbi0igEbFUIBE8KDUGfIwnisEkBw5KcBZ3XwnHmfznwlKo8QIDAQABo4IB
+# VTCCAVEwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQU3XRdTADbe5+gdMqxbvc8
+# wDLAcM0wHwYDVR0jBBgwFoAUtqFUOQLDoD+Oirz61PgcptE6Dv0wDgYDVR0PAQH/
+# BAQDAgEGMBMGA1UdJQQMMAoGCCsGAQUFBwMDMDAGA1UdHwQpMCcwJaAjoCGGH2h0
+# dHA6Ly9jcmwuY2VydHVtLnBsL2N0bmNhMi5jcmwwbAYIKwYBBQUHAQEEYDBeMCgG
+# CCsGAQUFBzABhhxodHRwOi8vc3ViY2Eub2NzcC1jZXJ0dW0uY29tMDIGCCsGAQUF
+# BzAChiZodHRwOi8vcmVwb3NpdG9yeS5jZXJ0dW0ucGwvY3RuY2EyLmNlcjA5BgNV
+# HSAEMjAwMC4GBFUdIAAwJjAkBggrBgEFBQcCARYYaHR0cDovL3d3dy5jZXJ0dW0u
+# cGwvQ1BTMA0GCSqGSIb3DQEBDAUAA4ICAQB1iFgP5Y9QKJpTnxDsQ/z0O23JmoZi
+# fZdEOEmQvo/79PQg9nLF/GJe6ZiUBEyDBHMtFRK0mXj3Qv3gL0sYXe+PPMfwmreJ
+# HvgFGWQ7XwnfMh2YIpBrkvJnjwh8gIlNlUl4KENTK5DLqsYPEtRQCw7R6p4s2EtW
+# yDDr/M58iY2UBEqfUU/ujR9NuPyKk0bEcEi62JGxauFYzZ/yld13fHaZskIoq2Xa
+# zjaD0pQkcQiIueL0HKiohS6XgZuUtCKA7S6CHttZEsObQJ1j2s0urIDdqF7xaXFV
+# aTHKtAuMfwi0jXtF3JJphrJfc+FFILgCbX/uYBPBlbBIP4Ht4xxk2GmfzMn7oxPI
+# TpigQFJFWuzTMUUgdRHTxaTSKRJ/6Uh7ki/pFjf9sUASWgxT69QF9Ki4JF5nBIuj
+# xZ2sOU9e1HSCJwOfK07t5nnzbs1LbHuAIGJsRJiQ6HX/DW1XFOlXY1rc9HufFhWU
+# +7Uk+hFkJsfzqBz3pRO+5aI6u5abI4Qws4YaeJH7H7M8X/YNoaArZbV4Ql+jarKs
+# E0+8XvC4DJB+IVcvC9Ydqahi09mjQse4fxfef0L7E3hho2O3bLDM6v60rIRUCi2f
+# JT2/IRU5ohgyTch4GuYWefSBsp5NPJh4QRTP9DC3gc5QEKtbrTY0Ka87Web7/zSc
+# vLmvQBm8JDFpDjCCBrkwggShoAMCAQICEQDn/2nHOzXOS5Em2HR8aKWHMA0GCSqG
+# SIb3DQEBDAUAMIGAMQswCQYDVQQGEwJQTDEiMCAGA1UEChMZVW5pemV0byBUZWNo
+# bm9sb2dpZXMgUy5BLjEnMCUGA1UECxMeQ2VydHVtIENlcnRpZmljYXRpb24gQXV0
+# aG9yaXR5MSQwIgYDVQQDExtDZXJ0dW0gVHJ1c3RlZCBOZXR3b3JrIENBIDIwHhcN
+# MjEwNTE5MDUzMjA3WhcNMzYwNTE4MDUzMjA3WjBWMQswCQYDVQQGEwJQTDEhMB8G
+# A1UEChMYQXNzZWNvIERhdGEgU3lzdGVtcyBTLkEuMSQwIgYDVQQDExtDZXJ0dW0g
+# VGltZXN0YW1waW5nIDIwMjEgQ0EwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIK
+# AoICAQDpEh8ENe25XXrFppVBvoplf0530W0lddNmjtv4YSh/f7eDQKFaIqc7tHj7
+# ox+u8vIsJZlroakUeMS3i3T8aJRC+eQs4FF0GqvkM6+WZO8kmzZfxmZaBYmMLs8F
+# ktgFYCzywmXeQ1fEExflee2OpbHVk665eXRHjH7MYZIzNnjl2m8Hy8ulB9mR8wL/
+# W0v0pjKNT6G0sfrx1kk+3OGosFUb7yWNnVkWKU4qSxLv16kJ6oVJ4BSbZ4xMak6J
+# LeB8szrK9vwGDpvGDnKCUMYL3NuviwH1x4gZG0JAXU3x2pOAz91JWKJSAmRy/l0s
+# 0l5bEYKolg+DMqVhlOANd8Yh5mkQWaMEvBRE/kAGzIqgWhwzN2OsKIVtO8mf5sPW
+# SrvyplSABAYa13rMYnzwfg08nljZHghquCJYCa/xHK9acev9UD7Y+usr15d7mrsz
+# zxhF1JOr1Mpup2chNSBlyOObhlSO16rwrffVrg/SzaKfSndS5swRhr8bnDqNJY9T
+# NyEYvBYpgF95K7p0g4LguR4A++Z1nFIHWVY5v0fNVZmgzxD9uVo/gta3onGOQj3J
+# CxgYx0KrCXu4yc9QiVwTFLWbNdHFSjBCt5/8Q9pLuRhVocdCunhcHudMS1CGQ/Rn
+# 0+7P+fzMgWdRKfEOh/hjLrnQ8BdJiYrZNxvIOhM2aa3zEDHNwwIDAQABo4IBVTCC
+# AVEwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUvlQCL79AbHNDzqwJJU6eQ0Qa
+# 7uAwHwYDVR0jBBgwFoAUtqFUOQLDoD+Oirz61PgcptE6Dv0wDgYDVR0PAQH/BAQD
+# AgEGMBMGA1UdJQQMMAoGCCsGAQUFBwMIMDAGA1UdHwQpMCcwJaAjoCGGH2h0dHA6
+# Ly9jcmwuY2VydHVtLnBsL2N0bmNhMi5jcmwwbAYIKwYBBQUHAQEEYDBeMCgGCCsG
+# AQUFBzABhhxodHRwOi8vc3ViY2Eub2NzcC1jZXJ0dW0uY29tMDIGCCsGAQUFBzAC
+# hiZodHRwOi8vcmVwb3NpdG9yeS5jZXJ0dW0ucGwvY3RuY2EyLmNlcjA5BgNVHSAE
+# MjAwMC4GBFUdIAAwJjAkBggrBgEFBQcCARYYaHR0cDovL3d3dy5jZXJ0dW0ucGwv
+# Q1BTMA0GCSqGSIb3DQEBDAUAA4ICAQC4k1l3yUwV/ZQHCKCneqAs8EGTnwEUJLdD
+# pokN/dMhKjK0rR5qX8nIIHzxpQR3TAw2IRw1Uxsr2PliG3bCFqSdQTUbfaTq6V3v
+# BzEebDru9QFjqlKnxCF2h1jhLNFFplbPJiW+JSnJTh1fKEqEdKdxgl9rVTvlxfEJ
+# 7exOn25MGbd/wGPwuSmMxRJVO0wnqgS7kmoJjNF9zqeehFSDDP8ZVkWg4EZ2tIS0
+# M3uZmByRr+1Lkwjjt8AtW83mVnZTyTsOb+FNfwJY7DS4FmWhkRbgcHRetreoTirP
+# Or/ozyDKhT8MTSTf6Lttg6s6T/u08mDWw6HK04ZRDfQ9sb77QV8mKgO44WGP31vX
+# nVKoWVJpFBjPvjL8/Zck/5wXX2iqjOaLStFOR/IQki+Ehn4zlcgVm22ZVCBPF+l8
+# nAwUUShCtKuSU7GmZLKCmmxQMkSiWILTm8EtVD6AxnJhoq8EnhjEEyUoflkeRF2W
+# hFiVQOmWTwZRr44IxWGkNJC6tTorW5rl2Zl+2e9JLPYf3pStAPMDoPKIjVXd6NW2
+# +fZrNUBeDo2eOa5Fn7Brs/HLQff5Xgris5MeUbdVgDrF8uxO6cLPvZPo63j62SsN
+# g55pTWk9fUIF9iPoRbb4QurjoY/woI1RAOKtYtTic6aAJq3u83RIPpGXBSJKwx4K
+# JAOZnCDCtTCCBtcwggS/oAMCAQICEBDvKijbxBHkfB51dwwvF+YwDQYJKoZIhvcN
+# AQELBQAwVjELMAkGA1UEBhMCUEwxITAfBgNVBAoTGEFzc2VjbyBEYXRhIFN5c3Rl
+# bXMgUy5BLjEkMCIGA1UEAxMbQ2VydHVtIENvZGUgU2lnbmluZyAyMDIxIENBMB4X
+# DTI2MTEyMzEwNDEyOVoXDTI4MDIyNTEwNDEyOFowfTELMAkGA1UEBhMCUEwxEjAQ
+# BgNVBAgMCXBvbW9yc2tpZTEQMA4GA1UEBwwHR2RhxYRzazEjMCEGA1UECgwaeERs
+# YWJzIEdyemVnb3J6IEt1bGlrb3dza2kxIzAhBgNVBAMMGnhEbGFicyBHcnplZ29y
+# eiBLdWxpa293c2tpMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAk/Zd
+# 6qSdAQ3L9BECicqWAGSDNG73qUNr4iVjgvgAQUL2zRSE/ecrxZSxsdGzicFviiyF
+# vr9nIDVoCj0HbSq0ZGzavaN4lgOXkBCFZ+t7v7YOEhvEk2NuIGvboH/KWMGyorXv
+# v5To+2k0s1A9Ep8RNT38GZ2XoFRfLhoagNiBkeOfMVECmjLZbGQonGfgbaXTc8Cy
+# lj0TiC6NcKBjCH666Nv71EY+rUdYXcq1qhJbt/JiwjcCcLWKv17NrpuO4zxz/MMj
+# fMkbS0HOtEXS6EXiDhVxUjwnzfE97tvdRo9lU9V9XzznFDvaRHFCKm0Qg8DpMnbP
+# 874aqvaglWQZyRkbAXzBp4Wfo1YtRO3hhrM5tJYTWnRsGuzxO820g70sfkiaNO/B
+# o2j0p/iBiuYAKjHuv5MUjWS8uld3e3VRA3EeYcqfelFccPefNdSZlKvyEdxfxE6H
+# t7y17xY7Q1+VGQdSDkbZtDb+WxcQxXkqFfm9VW5RqHl+rVQZOlbHBuHb/GiLpOBb
+# HahKOsxP+3YlSpuGOlOaVaM/jA8Tw3GkG0zMSsq2Yv3qJZrF7WpWUE6lE82yvtbL
+# 9lg2r7/nhQTs4F3Lnx7fOyyP0wAsdKQQzz3CpXCHGvYiwM3o8aUaxyHpgvHprhW5
+# SVUfNwIle1YsOsdbwQ3W8Uu+Tii28BQAeykx6X8CAwEAAaOCAXgwggF0MAwGA1Ud
+# EwEB/wQCMAAwPQYDVR0fBDYwNDAyoDCgLoYsaHR0cDovL2Njc2NhMjAyMS5jcmwu
+# Y2VydHVtLnBsL2Njc2NhMjAyMS5jcmwwcwYIKwYBBQUHAQEEZzBlMCwGCCsGAQUF
+# BzABhiBodHRwOi8vY2NzY2EyMDIxLm9jc3AtY2VydHVtLmNvbTA1BggrBgEFBQcw
+# AoYpaHR0cDovL3JlcG9zaXRvcnkuY2VydHVtLnBsL2Njc2NhMjAyMS5jZXIwHwYD
+# VR0jBBgwFoAU3XRdTADbe5+gdMqxbvc8wDLAcM0wHQYDVR0OBBYEFO2iQOyHh0wS
+# z0VDhZUtZKA8lK0tMEsGA1UdIAREMEIwCAYGZ4EMAQQBMDYGCyqEaAGG9ncCBQEE
+# MCcwJQYIKwYBBQUHAgEWGWh0dHBzOi8vd3d3LmNlcnR1bS5wbC9DUFMwEwYDVR0l
+# BAwwCgYIKwYBBQUHAwMwDgYDVR0PAQH/BAQDAgeAMA0GCSqGSIb3DQEBCwUAA4IC
+# AQAkSu7CvJjSVr74lRElbdVuSJkHs0pHJJLBk9JeNJR43eNMcWFmH/mBP3PuAHNz
+# 6BQGsy+U4nhHkMSn+9ZBI05I/D68Xzm9A6Si+M5O0vrvUOHgCXP0SVB+mo/LZYNs
+# yx/PRRdeWzQw7u5iprKtRvBnIvilw6XSLfeNWHuEQDM5MiNSj/t7ai0/+buB+yTr
+# NEN4Hy/1N/CPWbCWk8DmjQEz+oqz++dHoeaE3AL6EWL+LM/r6CNVSNXQABa6IdC1
+# hPJygcX3KDs2xsmNqgEXQ2SdIn9iGr4n2DZd5zvlSJuFDTN07/w5k+0OW6oWMRUK
+# he+dA0uBoqFQySC1WKS0mClv1tCZa1eDbrunzE7QK73SkGH7gk8d41TZkxCf5Zzy
+# lJeE+CIjXSKn9lbN09qWwFkUJE0J6wJyrKFFFu675oXnYXjp0T+SlJbHcGSiivE+
+# aCN2UHWuIwoY+5v6TXpoWCkgAmB1IubbT/X4cTRp1OWyeNxmSVxj2D1qmuLJcAmN
+# kLhGMGX04ApTZ8tQdxscmvdD9SMoifjDEKnM/i0Yg7JubwvwaYWA3G18+hnqa2cZ
+# fhTJQGIHbTJixbgXLhS9K+KGUbcccT2Mo07YmT//aqx7bp/pqoQd19V2JA/xwCcl
+# 1of7rlnKHGEoDq2YwmUtXK8R8XMjoEgkAmf+6tNJDj8k/zGCByIwggceAgEBMGow
+# VjELMAkGA1UEBhMCUEwxITAfBgNVBAoTGEFzc2VjbyBEYXRhIFN5c3RlbXMgUy5B
+# LjEkMCIGA1UEAxMbQ2VydHVtIENvZGUgU2lnbmluZyAyMDIxIENBAhAQ7yoo28QR
+# 5HwedXcMLxfmMA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAIoAKA
+# AKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEO
+# MAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEICJvNPJczA0zDqLyZsrg1NNd
+# bojmsNedZDrsjAs8mzeoMA0GCSqGSIb3DQEBAQUABIICAF4UR0MvNX/e53jJJbL2
+# BytcTWpq6QxGzPzDmrJtXzBLZF0QrH91RZUmQUuNrQNxefzIHbVieIQA8YZXn1s0
+# Qry2FTXnViTXNvFkxpEsjtDe/1NM4ld+JcWz33J3GD+U7GNs5ozy6N+Yxt4uFmAo
+# faIAlgJWno+ptoVTYejr1PfbwFXAivxBfZBitOwzYJSB2pimJw2KqT+gN5MygIUj
+# AJcKB3Kl0p/TpqBg7aaQVBJuxkzSAmiJY1wlrXf/XNa4dYV6B9agM0VTSua9Ubj1
+# RPv5SuhAR06Ey+v13qpUbw1xuCIKdCzF8ik2itydwt9VSXqIqBPREt+P0pgcMPt3
+# O6cUMiHDZ2Ssrxu69AnKCc36hvn50rLUbOcj0bZm+RGPzWo1oWIzkET30Ctuqqpo
+# ce/0njS9eTBXxLr9y/P0nlDyUS58EQ9C4SMIuVedtffxxk1gkapQxrA+Hd0eg0vQ
+# PCSkevK4neidAOIfMbfWHAl0vjSsnxbXZ0sytFjaFQ4iHe3lFUwYeVVGwcIFINzl
+# obAO/yvobLieeO7Ee8Wnkve6ndM6Dk4jmD9IasIHZlM1yrxe59PNSQXHGLRxBSKs
+# 6qU8p2/Elyyug0caxlukJyCSLX94wSsqRf2dfkCsuVDVSj+sQh+NaI5TatgEz237
+# aM53HeCgJ+lur+fJxAeyZ2NCoYIEAjCCA/4GCSqGSIb3DQEJBjGCA+8wggPrAgEB
+# MGowVjELMAkGA1UEBhMCUEwxITAfBgNVBAoTGEFzc2VjbyBEYXRhIFN5c3RlbXMg
+# Uy5BLjEkMCIGA1UEAxMbQ2VydHVtIFRpbWVzdGFtcGluZyAyMDIxIENBAhAo8HfB
+# HDa9/l90MkdwJy4DMA0GCWCGSAFlAwQCAgUAoIIBVjAaBgkqhkiG9w0BCQMxDQYL
+# KoZIhvcNAQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEyNzAxMDk0MFowNwYLKoZI
+# hvcNAQkQAi8xKDAmMCQwIgQghb6Q4QrSQ418ySi2r0iwmrIIF3zs+LASbFjTkQUl
+# xDwwPwYJKoZIhvcNAQkEMTIEMMWnH1r6aL9nMpg5UoQdch53nhb5kqKhJRMYOMuf
+# 7djGIVqbsjpUxpfG4UilYbd6aTCBnwYLKoZIhvcNAQkQAgwxgY8wgYwwgYkwgYYE
+# FFcUaEEMqFrzQk75FkpRNhD0042YMG4wWqRYMFYxCzAJBgNVBAYTAlBMMSEwHwYD
+# VQQKExhBc3NlY28gRGF0YSBTeXN0ZW1zIFMuQS4xJDAiBgNVBAMTG0NlcnR1bSBU
+# aW1lc3RhbXBpbmcgMjAyMSBDQQIQKPB3wRw2vf5fdDJHcCcuAzANBgkqhkiG9w0B
+# AQEFAASCAgChOMOmLhUjCOazIM2pKVEDFCLHd0beWR/BYovu1ld2ebVdlgG8cEyQ
+# HUufKdXDZYecVQOEC7cgDDbQ3h8MbSydcnD6pDrjhbrQ2FvECQcU6kI+kKtWWs8r
+# QJ+jyQtEmxEzeoteMWnFqHVoGDIsdKSAQVkcQbJFEHxJ5A05NurEujlfrudgnN3R
+# n8xU1Y8vyr5eSNOVz18rsSw89blX4VK+Y6wNBVEDOhSSMqaXDTHXvpZMLACtAGTS
+# u9Od98sm0oZ1WUg//uFZAL7KkZNHLrI6ma5EnjDcp+yfURFVIxY/3lWzba2FJ+Yd
+# SpfJhrvQ8/MHhj+ZgvQ+ww2XyDT2wXtrVRlp3WCvvSw6zYsVadYSJvtUA+mcn1lf
+# +3WsJj9zTw5QtqBBdPCLpwO+myMRYZdo8Iexdme6chzrmJjQtyio1m3Rz8rtGFZG
+# buz6o5frU8pAun3NQOYSX6xySUNk66IwGPPWi2JDdMbZWtLzjFAjKPeekjz5VDH5
+# D43DvYab9y6Ukaf5Xm9opY4kYwR5SePsa0ljIetm4OuVQDOBEKWlDQGdzf810tDb
+# urQPbtBEDWeyt8paeLrY/Ohl1kCK3VFK+MFQzy6fxOylv7hiwbbLJTXqEzwo0kph
+# luwXss7RSEWPxXFjR65ExWerxx0ZVKe+GWzKJtdXrdKSeY0ZiuqYJw==
+# SIG # End signature block
